@@ -1,0 +1,171 @@
+// Supabase Edge Function: daily-summary
+// Emails managers a summary table of the team's day (period "day") or week
+// (period "week"): login/logout, hours by task, status updates, open and
+// overdue work. Runs on a schedule (pg_cron) or when a manager clicks
+// "Email me this summary" in the portal's Reports tab.
+// Settings (Edge Functions → Secrets): HOOK_SECRET, GMAIL_USER, GMAIL_APP_PASSWORD,
+// optional PORTAL_URL. "Verify JWT" must be OFF — the function checks access itself.
+
+import nodemailer from 'npm:nodemailer@6.9.16';
+
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? Deno.env.get('SERVICE_KEY')!;
+const HOOK_SECRET = Deno.env.get('HOOK_SECRET')!;
+const GMAIL_USER = Deno.env.get('GMAIL_USER')!;
+const GMAIL_APP_PASSWORD = (Deno.env.get('GMAIL_APP_PASSWORD') ?? '').replace(/\s+/g, '');
+const PORTAL_URL = Deno.env.get('PORTAL_URL') ?? '';
+const PORTAL_NAME = Deno.env.get('PORTAL_NAME') ?? 'Team Work Portal';
+
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+};
+
+/* ---------- dates (India time) ---------- */
+const istToday = () => new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+const addDays = (d: string, n: number) => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+const weekStart = (d: string) => { const x = new Date(d + 'T00:00:00Z'); return addDays(d, -((x.getUTCDay() + 6) % 7)); };
+const fmtDay = (d: string, opts: Intl.DateTimeFormatOptions) => new Date(d + 'T00:00:00Z').toLocaleDateString('en-IN', { timeZone: 'UTC', ...opts });
+const hm = (t: string | null) => t ? t.slice(0, 5) : '';
+const minutes = (t: string) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
+const h2 = (n: number) => (Math.round(n * 100) / 100).toString();
+
+/* ---------- data ---------- */
+type Row = Record<string, any>;
+async function rest(path: string): Promise<Row[]> {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, { headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}` } });
+  if (!r.ok) throw new Error(`${path.split('?')[0]}: ${r.status} ${await r.text()}`);
+  return r.json();
+}
+export async function loadData(from: string, to: string) {
+  const startTs = encodeURIComponent(`${from}T00:00:00+05:30`), endTs = encodeURIComponent(`${addDays(to, 1)}T00:00:00+05:30`);
+  const [profiles, attendance, entries, tasks, updates, engs, clients] = await Promise.all([
+    rest('profiles?active=eq.true&select=id,full_name,email,role,summary_email&order=full_name'),
+    rest(`attendance?work_date=gte.${from}&work_date=lte.${to}&select=*`),
+    rest(`time_entries?entry_date=gte.${from}&entry_date=lte.${to}&select=user_id,entry_date,hours,description,task_id,engagement_id`),
+    rest('tasks?select=id,title,assignee,status,due_date,engagement_id'),
+    rest(`task_updates?created_at=gte.${startTs}&created_at=lt.${endTs}&select=task_id,author,status_to,body,link_url,created_at&order=created_at`),
+    rest('engagements?select=id,name,client_id'),
+    rest('clients?select=id,name'),
+  ]);
+  return { profiles, attendance, entries, tasks, updates, engs, clients };
+}
+
+/* ---------- email HTML ---------- */
+const esc = (s: unknown) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+const C = { ink: '#1F2629', pencil: '#667075', rule: '#E2E5E1', paper: '#F6F7F5', ledger: '#2A6F6B', red: '#B33A2F', green: '#3C7A4A' };
+const th = (s: string, align = 'left') => `<th style="text-align:${align};padding:8px 10px;border-bottom:1px solid ${C.rule};font:600 12px Arial,sans-serif;color:${C.pencil};white-space:nowrap">${s}</th>`;
+const td = (s: string, align = 'left', extra = '') => `<td style="text-align:${align};padding:8px 10px;border-bottom:1px solid ${C.rule};font:13px Arial,sans-serif;color:${C.ink};vertical-align:top;${extra}">${s}</td>`;
+const table = (head: string, rows: string) => `<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%;background:#fff;border:1px solid ${C.rule};border-radius:8px">${head}${rows}</table>`;
+const shell = (title: string, sub: string, inner: string) => `<!doctype html><html><body style="margin:0;background:${C.paper};padding:24px">
+  <div style="max-width:900px;margin:0 auto">
+  <div style="font:600 20px Arial,sans-serif;color:${C.ink}">${esc(title)}</div>
+  <div style="font:13px Arial,sans-serif;color:${C.pencil};margin:4px 0 18px">${esc(sub)}</div>
+  ${inner}
+  ${PORTAL_URL ? `<p style="font:13px Arial,sans-serif;margin-top:18px"><a href="${esc(PORTAL_URL)}" style="color:${C.ledger}">Open ${esc(PORTAL_NAME)}</a></p>` : ''}
+  <p style="font:11px Arial,sans-serif;color:${C.pencil};margin-top:18px">Sent automatically by ${esc(PORTAL_NAME)}.</p>
+  </div></body></html>`;
+
+export function buildSummary(period: 'day' | 'week', from: string, to: string, data: Awaited<ReturnType<typeof loadData>>, today = istToday()) {
+  const inRange = (x: string) => x >= from && x <= to;
+  const d = { ...data, entries: data.entries.filter(e => inRange(e.entry_date)), attendance: data.attendance.filter(a => inRange(a.work_date)) };
+  const hmDur = (h: number) => `${Math.floor(h)}h ${String(Math.round((h % 1) * 60)).padStart(2, '0')}m`;
+  const engName = (id: string | null) => { const e = d.engs.find(x => x.id === id); if (!e) return 'General / internal'; const c = d.clients.find(x => x.id === e.client_id); return (c ? c.name + ' – ' : '') + e.name; };
+  const taskT = (id: string | null) => d.tasks.find(t => t.id === id)?.title;
+  const people = d.profiles.filter(p => p.role === 'member' || d.entries.some(e => e.user_id === p.id) || d.attendance.some(a => a.user_id === p.id));
+  const name = (p: Row) => p.full_name || p.email;
+  const openOf = (id: string) => d.tasks.filter(t => t.assignee === id && t.status !== 'Done');
+  const overOf = (id: string) => openOf(id).filter(t => t.due_date && t.due_date < today);
+  const totalHrs = d.entries.reduce((s, e) => s + Number(e.hours), 0);
+
+  if (period === 'day') {
+    const rows = people.map(p => {
+      const a = d.attendance.find(x => x.user_id === p.id && x.work_date === from);
+      const es = d.entries.filter(e => e.user_id === p.id);
+      const hrs = es.reduce((s, e) => s + Number(e.hours), 0);
+      const byTask = new Map<string, number>();
+      es.forEach(e => { const k = taskT(e.task_id) || engName(e.engagement_id); byTask.set(k, (byTask.get(k) || 0) + Number(e.hours)); });
+      const ups = d.updates.filter(u => u.author === p.id);
+      const span = a?.login_at && a?.logout_at ? (minutes(a.logout_at) - minutes(a.login_at) - (a.break_mins || 0)) / 60 : null;
+      const upHtml = ups.map(u => `${esc(taskT(u.task_id) || 'Task')}: ${u.status_to ? `<b>${esc(u.status_to)}</b>` : ''}${u.body ? ' ' + esc(u.body.slice(0, 120)) : ''}${u.link_url ? ` <a href="${esc(u.link_url)}" style="color:${C.ledger}">file</a>` : ''}`).join('<br>');
+      return '<tr>' +
+        td(`<b>${esc(name(p))}</b>`) +
+        td(a?.login_at ? hm(a.login_at) : `<span style="color:${C.red}">No login</span>`, 'center') +
+        td(a?.logout_at ? hm(a.logout_at) : '–', 'center') +
+        td(`<b>${h2(hrs)}</b>${span !== null ? `<div style="color:${C.pencil};font-size:11px">of ${hmDur(span)} at work</div>` : ''}`, 'right') +
+        td([...byTask].map(([k, v]) => `${esc(k)} <span style="color:${C.pencil}">${h2(v)}h</span>`).join('<br>') || '<span style="color:#98A1A6">–</span>') +
+        td(upHtml || '<span style="color:#98A1A6">–</span>') +
+        td(String(openOf(p.id).length), 'center') +
+        td(overOf(p.id).length ? `<span style="color:${C.red};font-weight:bold">${overOf(p.id).length}</span>` : '0', 'center') + '</tr>';
+    }).join('');
+    const loggedIn = people.filter(p => d.attendance.some(a => a.user_id === p.id && a.work_date === from && a.login_at)).length;
+    const head = '<tr>' + th('Member') + th('Login', 'center') + th('Logout', 'center') + th('Hours', 'right') + th('Time by task') + th('Updates') + th('Open', 'center') + th('Overdue', 'center') + '</tr>';
+    const title = `Team summary for ${fmtDay(from, { weekday: 'long', day: 'numeric', month: 'long' })}`;
+    const sub = `${loggedIn} of ${people.length} logged in, ${h2(totalHrs)} hours logged, ${d.updates.length} task updates`;
+    return { subject: `${PORTAL_NAME}: ${fmtDay(from, { day: 'numeric', month: 'short' })} daily summary`, html: shell(title, sub, table(head, rows || `<tr>${td('No team members yet.')}</tr>`)), title };
+  }
+
+  const days: string[] = []; for (let x = from; x <= to; x = addDays(x, 1)) days.push(x);
+  const rows = people.map(p => {
+    const es = d.entries.filter(e => e.user_id === p.id);
+    const per = days.map(day => es.filter(e => e.entry_date === day).reduce((s, e) => s + Number(e.hours), 0));
+    const present = d.attendance.filter(a => a.user_id === p.id && a.login_at).length;
+    const done = new Set(d.updates.filter(u => u.status_to === 'Done' && d.tasks.find(t => t.id === u.task_id)?.assignee === p.id).map(u => u.task_id)).size;
+    return '<tr>' + td(`<b>${esc(name(p))}</b>`) + per.map(v => td(v ? h2(v) : '<span style="color:#98A1A6">–</span>', 'right')).join('') +
+      td(`<b>${h2(per.reduce((a, b) => a + b, 0))}</b>`, 'right') + td(String(present), 'center') + td(String(done), 'center') +
+      td(String(openOf(p.id).length), 'center') + td(overOf(p.id).length ? `<span style="color:${C.red};font-weight:bold">${overOf(p.id).length}</span>` : '0', 'center') + '</tr>';
+  }).join('');
+  const head = '<tr>' + th('Member') + days.map(x => th(fmtDay(x, { weekday: 'short', day: 'numeric' }), 'right')).join('') + th('Total', 'right') + th('Days in', 'center') + th('Completed', 'center') + th('Open', 'center') + th('Overdue', 'center') + '</tr>';
+  // hours by engagement
+  const byEng = new Map<string, number>(); d.entries.forEach(e => { const k = engName(e.engagement_id); byEng.set(k, (byEng.get(k) || 0) + Number(e.hours)); });
+  const engRows = [...byEng].sort((a, b) => b[1] - a[1]).map(([k, v]) => '<tr>' + td(esc(k)) + td(h2(v), 'right') + '</tr>').join('');
+  const title = `Team summary for the week of ${fmtDay(from, { day: 'numeric', month: 'long' })}`;
+  const sub = `${fmtDay(from, { day: 'numeric', month: 'short' })} to ${fmtDay(to, { day: 'numeric', month: 'short' })}, ${h2(totalHrs)} hours logged`;
+  const inner = table(head, rows || `<tr>${td('No team members yet.')}</tr>`) +
+    (engRows ? `<div style="font:600 14px Arial,sans-serif;color:${C.ink};margin:22px 0 8px">Hours by engagement</div>` + table('<tr>' + th('Engagement') + th('Hours', 'right') + '</tr>', engRows) : '');
+  return { subject: `${PORTAL_NAME}: weekly summary, ${fmtDay(from, { day: 'numeric', month: 'short' })} – ${fmtDay(to, { day: 'numeric', month: 'short' })}`, html: shell(title, sub, inner), title };
+}
+
+/* ---------- who is asking ---------- */
+async function managerFromJwt(authHeader: string | null): Promise<Row | null> {
+  const token = authHeader?.replace(/^Bearer\s+/i, '');
+  if (!token) return null;
+  const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, { headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${token}` } });
+  if (!r.ok) return null;
+  const u = await r.json();
+  const [p] = await rest(`profiles?id=eq.${u.id}&select=*`);
+  return p && p.active && p.role === 'manager' ? p : null;
+}
+
+if (import.meta.main) Deno.serve(async req => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS });
+  const reply = (body: unknown, status = 200) => Response.json(body, { status, headers: CORS });
+  try {
+    const input = await req.json().catch(() => ({}));
+    const period: 'day' | 'week' = input.period === 'week' ? 'week' : 'day';
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(input.date || '') ? input.date : istToday();
+    const from = period === 'day' ? date : weekStart(date), to = period === 'day' ? date : addDays(weekStart(date), 6);
+
+    let recipients: string[];
+    if (req.headers.get('x-cron-secret') === HOOK_SECRET && HOOK_SECRET) {
+      const managers = await rest('profiles?active=eq.true&role=eq.manager&select=summary_email');
+      recipients = managers.map(m => m.summary_email).filter((e: string) => /@/.test(e));
+    } else {
+      const me = await managerFromJwt(req.headers.get('Authorization'));
+      if (!me) return reply({ error: 'Only managers can send summaries.' }, 403);
+      if (!/@/.test(me.summary_email || '')) return reply({ error: 'Add your summary email under Profile first.' }, 400);
+      recipients = [me.summary_email];
+    }
+    if (!recipients.length) return reply({ sent: 0, note: 'No manager has a summary email set.' });
+
+    const data = await loadData(from, to);
+    const { subject, html } = buildSummary(period, from, to, data);
+    const mail = nodemailer.createTransport({ host: 'smtp.gmail.com', port: 465, secure: true, auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD } });
+    await mail.sendMail({ from: `"${PORTAL_NAME}" <${GMAIL_USER}>`, to: recipients.join(', '), subject, html });
+    return reply({ sent: recipients.length, to: recipients, period, from, to_date: to });
+  } catch (e) {
+    console.error(e);
+    return reply({ error: String((e as Error).message || e) }, 500);
+  }
+});

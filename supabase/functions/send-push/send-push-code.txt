@@ -1,0 +1,99 @@
+// Supabase Edge Function: send-push
+// Called by the database whenever a notification is created. Sends a push
+// alert to every device the person has turned alerts on for.
+// Settings (Edge Functions → Secrets): HOOK_SECRET, VAPID_PUBLIC_KEY,
+// VAPID_PRIVATE_KEY, VAPID_SUBJECT (e.g. mailto:you@yourfirm.com)
+// "Verify JWT" must be OFF for this function — it checks HOOK_SECRET instead.
+
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? Deno.env.get('SERVICE_KEY')!;
+const HOOK_SECRET = Deno.env.get('HOOK_SECRET')!;
+const VAPID_PUBLIC_KEY = Deno.env.get('VAPID_PUBLIC_KEY')!;
+const VAPID_PRIVATE_KEY = Deno.env.get('VAPID_PRIVATE_KEY')!;
+const VAPID_SUBJECT = Deno.env.get('VAPID_SUBJECT') ?? 'mailto:admin@example.com';
+
+/* ---------- Web Push (RFC 8291 aes128gcm + RFC 8292 VAPID), WebCrypto only ---------- */
+const enc = new TextEncoder();
+const b64u = {
+  dec(s: string): Uint8Array {
+    s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '=';
+    return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+  },
+  enc(b: Uint8Array): string {
+    let s = ''; b.forEach(x => s += String.fromCharCode(x));
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  },
+};
+const concat = (...a: Uint8Array[]) => { const o = new Uint8Array(a.reduce((n, x) => n + x.length, 0)); let i = 0; for (const x of a) { o.set(x, i); i += x.length; } return o; };
+async function hmac(key: Uint8Array, data: Uint8Array) {
+  const k = await crypto.subtle.importKey('raw', key as BufferSource, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, data as BufferSource));
+}
+
+export async function vapidHeader(endpoint: string, publicKey: string, privateKey: string, subject: string) {
+  const pub = b64u.dec(publicKey);
+  const jwk = { kty: 'EC', crv: 'P-256', x: b64u.enc(pub.slice(1, 33)), y: b64u.enc(pub.slice(33, 65)), d: privateKey, ext: true };
+  const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const head = b64u.enc(enc.encode(JSON.stringify({ typ: 'JWT', alg: 'ES256' })));
+  const body = b64u.enc(enc.encode(JSON.stringify({ aud: new URL(endpoint).origin, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: subject })));
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(head + '.' + body)));
+  return `vapid t=${head}.${body}.${b64u.enc(sig)}, k=${publicKey}`;
+}
+
+export async function encryptPayload(p256dh: string, authSecret: string, payload: Uint8Array) {
+  const uaPublic = b64u.dec(p256dh), auth = b64u.dec(authSecret);
+  const local = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']) as CryptoKeyPair;
+  const asPublic = new Uint8Array(await crypto.subtle.exportKey('raw', local.publicKey));
+  const uaKey = await crypto.subtle.importKey('raw', uaPublic as BufferSource, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const ecdh = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: uaKey }, local.privateKey, 256));
+  const prkKey = await hmac(auth, ecdh);
+  const ikm = await hmac(prkKey, concat(enc.encode('WebPush: info\0'), uaPublic, asPublic, new Uint8Array([1])));
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const prk = await hmac(salt, ikm);
+  const cek = (await hmac(prk, concat(enc.encode('Content-Encoding: aes128gcm\0'), new Uint8Array([1])))).slice(0, 16);
+  const nonce = (await hmac(prk, concat(enc.encode('Content-Encoding: nonce\0'), new Uint8Array([1])))).slice(0, 12);
+  const aes = await crypto.subtle.importKey('raw', cek, 'AES-GCM', false, ['encrypt']);
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aes, concat(payload, new Uint8Array([2]))));
+  const header = new Uint8Array(21); header.set(salt, 0); new DataView(header.buffer).setUint32(16, 4096); header[20] = 65;
+  return concat(header, asPublic, cipher);
+}
+
+async function sendPush(sub: { endpoint: string; p256dh: string; auth: string }, data: unknown) {
+  const body = await encryptPayload(sub.p256dh, sub.auth, enc.encode(JSON.stringify(data)));
+  return fetch(sub.endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: await vapidHeader(sub.endpoint, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT),
+      'Content-Encoding': 'aes128gcm', 'Content-Type': 'application/octet-stream', TTL: '86400', Urgency: 'high',
+    },
+    body,
+  });
+}
+
+/* ---------- database helpers ---------- */
+const rest = (path: string, init: RequestInit = {}) => fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+  ...init, headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}`, 'Content-Type': 'application/json', ...(init.headers || {}) },
+});
+
+if (import.meta.main) Deno.serve(async req => {
+  if (req.method !== 'POST' || req.headers.get('x-hook-secret') !== HOOK_SECRET) return new Response('Forbidden', { status: 403 });
+  const { notification_id } = await req.json().catch(() => ({}));
+  if (!notification_id) return new Response('Missing notification_id', { status: 400 });
+
+  const nRes = await rest(`notifications?id=eq.${encodeURIComponent(notification_id)}&select=*`);
+  const [n] = await nRes.json();
+  if (!n) return new Response('Not found', { status: 404 });
+  const subs = await (await rest(`push_subscriptions?user_id=eq.${n.user_id}&select=*`)).json();
+
+  const data = { id: n.id, title: n.title, body: n.body, task_id: n.task_id, kind: n.kind };
+  let sent = 0, removed = 0;
+  await Promise.all((subs || []).map(async (s: { id: string; endpoint: string; p256dh: string; auth: string }) => {
+    try {
+      const r = await sendPush(s, data);
+      if (r.status === 404 || r.status === 410) { await rest(`push_subscriptions?id=eq.${s.id}`, { method: 'DELETE' }); removed++; }
+      else if (r.ok) sent++;
+      else console.warn('push failed', r.status, await r.text());
+    } catch (e) { console.warn('push error', e); }
+  }));
+  return Response.json({ sent, removed, devices: subs.length });
+});

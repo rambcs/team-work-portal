@@ -1,82 +1,65 @@
 # Team Work Portal
 
-A small web portal for an audit team:
+Task assignment, daily timesheets and team tracking for an audit team. Hosted free on GitHub Pages; Supabase runs the logins, database, push alerts and summary emails.
 
-- **Assignments.** The manager assigns tasks, areas/roles or instructions to one or more team members, with a client and engagement, due date, priority and detailed notes.
-- **My day.** Each member sees their overdue, due-today and upcoming work. They update the status and post comments on each task.
-- **Timesheets.** Members log their daily hours against an engagement and, optionally, a task. The manager sees a weekly grid for the whole team and totals per engagement.
-- **Team view.** The manager sees, for any day, who has logged time, what they did, and what is overdue or blocked.
-- **Setup.** The manager maintains clients, engagements and team members.
+## What it does
 
-It is a plain HTML/JavaScript site with no build step. It is hosted free on GitHub Pages and uses a free **Supabase** project for logins and the database.
+**Manager**
+- **Team:** for any day, see each person's login, logout and hours, drawn as a day ledger, plus anything overdue or blocked.
+- **Assignments:** assign tasks, areas/roles or instructions to one or more people. Each assignment can carry a client and engagement, due date, priority, instructions and OneDrive reference links. Afterwards, the portal offers to notify them on WhatsApp.
+- **Timesheets:** see anyone's day, or the whole team's week.
+- **Reports:** daily and weekly summary tables, which you can download as CSV or email to yourself. They are also emailed automatically every evening and each Saturday.
+- **Setup:** manage people (names, WhatsApp numbers, roles, access), clients and engagements.
 
-**Who can see what** (enforced in the database, not just hidden in the screens):
-
-| | Manager | Member |
-|---|---|---|
-| Tasks | All | Only their own |
-| Change task details | Yes | No. They can only change the status and post updates |
-| Timesheets | Read everyone's | Only their own (read + edit) |
-| Clients and engagements | Create and edit | Read only |
-| Deactivated users | n/a | See nothing |
-
----
-
-## Setup (about 30 minutes, easiest on a laptop)
-
-### 1. Create a GitHub account and repository
-1. Sign up at **github.com** (free).
-2. Click **+ → New repository**. Name it `team-work-portal` and choose **Public**, because free GitHub Pages needs a public repo. The code holds no client data; all data stays in Supabase behind logins. Tick **Add a README** and click **Create repository**.
-3. In the repo, click **Add file → Upload files**. Drag in **everything inside** this folder (`index.html`, `app.js`, `styles.css`, `config.js`, `README.md`, `.nojekyll` and the `supabase` folder), then click **Commit changes**.
-
-> If you'd rather keep the repo private, connect it to **Vercel** or **Netlify** instead of GitHub Pages. Both host private repos free.
-
-### 2. Create the Supabase project
-1. Sign up at **supabase.com** with your GitHub account, then click **New project**.
-   Region: **South Asia (Mumbai)**. Save the database password somewhere safe.
-2. Open **SQL Editor → New query**, paste the whole of `supabase/schema.sql` and click **Run**.
-   You should see "Success. No rows returned".
-3. Go to **Authentication → Sign In / Providers** and turn **off** "Allow new users to sign up".
-   Only people you add yourself can then get in.
-
-### 3. Connect the site to Supabase
-1. In Supabase, open **Project Settings → API** (or the **Connect** button). Copy the **Project URL** and the **anon public** key.
-   Never use the `service_role` key in the site.
-2. In GitHub, open `config.js`, click the ✏️ pencil, paste the two values in place of the placeholders and click **Commit changes**.
-
-### 4. Turn on the website
-1. In the GitHub repo, go to **Settings → Pages → Build and deployment**. Set Source to **Deploy from a branch**, Branch to **main** and folder to **/ (root)**, then click **Save**.
-2. After a minute or two the address appears at the top of that page, e.g. `https://yourname.github.io/team-work-portal/`.
-3. In Supabase, go to **Authentication → URL Configuration**. Set **Site URL** to that address and add it under **Redirect URLs**.
-
-### 5. Add yourself and make yourself manager
-1. In Supabase, go to **Authentication → Users → Add user → Create new user**. Enter your email and a password, tick **Auto Confirm User**, then click **Create**.
-2. In **SQL Editor**, run (with your email):
-   ```sql
-   update public.profiles set role = 'manager' where email = 'you@yourfirm.com';
-   ```
-3. Open the portal and sign in. You'll land on **Team view**. Go to **Setup** to add clients and engagements.
-
-### 6. Add your team
-For each person, go to **Authentication → Users → Add user → Create new user** with their email and a temporary password, and tick Auto Confirm. Send them the portal link and their login. They can change the password from the **Password** link at the top. In the portal's **Setup** tab you can fix their display name, make someone a second manager, or **Deactivate** someone who leaves. Their history is kept.
-
-> **Why not invite emails?** Supabase's free built-in email service only delivers to a few pre-approved addresses and is heavily rate-limited. Creating users with a password avoids email entirely. The "email me a sign-in link" button only works once you add your own email provider (**Project Settings → Authentication → SMTP**).
-
----
-
-## Good to know
-- **Free-tier limits.** Supabase pauses a free project after about a week with no activity. Daily use keeps it awake; if it does pause, click **Restore** in the dashboard. The free tier is far more than a small team needs.
-- **Backups.** The free tier has no point-in-time backups. To export, use Supabase **Table Editor → (table) → Export to CSV**.
-- **History loaded.** The screens load the last 180 days of timesheets (`HISTORY_DAYS` in `app.js`). Older data stays in the database.
-- **Live updates.** Changes made by others appear within a second or two, and also whenever you switch back to the tab.
-- **Client confidentiality.** Engagement names and work descriptions are stored in your Supabase project. Check this fits your firm's data policy.
+**Team member**
+- **My day:** log in and log out, see the day ledger and your tasks by due date.
+- **Tasks:** post updates on a task that set its status, link the updated OneDrive file or folder, and add remarks.
+- **Timesheet:** login and logout times plus hours for each task.
+- **Alerts:** a pop-up on phone or laptop whenever a task is assigned or updated, even when the portal is closed.
 
 ## Files
-```
-index.html            page shell
-styles.css            styling (mobile-first)
-app.js                all app logic (Supabase JS loaded from CDN)
-config.js             your Supabase URL + anon key  ← edit this
-supabase/schema.sql   tables, security rules, triggers ← run once in Supabase
-.nojekyll             tells GitHub Pages to serve files as-is
-```
+
+| File | Purpose |
+|---|---|
+| `index.html`, `styles.css`, `app.js` | The portal |
+| `config.js` | Supabase address, public key, public push key |
+| `sw.js`, `manifest.webmanifest`, `icon-*.png` | Push alerts and "add to Home Screen" |
+| `supabase/schema.sql` | Original database setup (already run) |
+| `supabase/upgrade_v2.sql` | Version 2 database upgrade |
+| `supabase/functions/send-push/index.ts` | Server function that sends push alerts |
+| `supabase/functions/daily-summary/index.ts` | Server function that sends summary emails |
+
+The private keys (push private key, shared secret, Gmail app password) live only in Supabase. Never put them in this repo.
+
+## Setting up version 2
+
+Do these on a laptop, in order.
+
+1. **Upgrade the database.** In Supabase, open SQL Editor, paste `supabase/upgrade_v2.sql` and click Run.
+2. **Create a Gmail app password.** Use the Gmail account that will send the summaries. Go to myaccount.google.com, then Security, and turn on 2-Step Verification. Then search for "App passwords", create one named "Team portal" and copy the 16-letter password.
+3. **Add the secrets.** In Supabase, go to Edge Functions, then Secrets, and add each name and value from your private setup file.
+4. **Deploy the two functions.** Go to Edge Functions and choose Deploy a new function, then Via Editor:
+   - Name it `send-push`, paste `supabase/functions/send-push/index.ts` and deploy.
+   - Name it `daily-summary`, paste `supabase/functions/daily-summary/index.ts` and deploy.
+   - For **each** function, open its settings and turn **off** "Verify JWT" (also called "Enforce JWT verification"), then save. Each function checks access itself.
+5. **Turn on alerts and schedules.** Run the private `setup_alerts.sql` in SQL Editor. It should list two jobs.
+6. **Upload the site.** In GitHub, choose Add file, then Upload files, and drag in everything from this folder. Commit.
+7. **Fill in your details in the portal.** Open Profile, add your summary email and click Save. Then click Turn on alerts. In Setup, add each person's WhatsApp number.
+8. **Test.** In Reports, click "Email me this summary".
+
+### Schedule
+- Daily summary: Monday to Saturday at 7:00 pm.
+- Weekly summary: Saturday at 7:15 pm.
+- Both go to every manager who has a summary email in their Profile.
+
+To change the times, edit the two `cron.schedule` lines in `setup_alerts.sql` (times are in UTC; India is UTC+5:30) and run the file again.
+
+### Alerts on phones
+- **Android (Chrome):** open the portal, then Profile, then Turn on alerts.
+- **iPhone:** open the portal in Safari, tap Share, then Add to Home Screen. Open it from the Home Screen icon, then go to Profile and Turn on alerts. Apple only allows alerts for portals added to the Home Screen.
+- **Laptop (Chrome or Edge):** Profile, then Turn on alerts.
+
+Alerts go to the device each person turned them on for. If several people share one device, the last person to sign in on it gets the alerts.
+
+## Adding team members
+In Supabase, go to Authentication, then Users, then Add user, then Create new user. Use an email-style ID such as `name@bcs.team`, set a password and tick **Auto Confirm User**. They appear in Setup straight away. There is no "forgot password" email, so reset passwords from the same Supabase screen.
